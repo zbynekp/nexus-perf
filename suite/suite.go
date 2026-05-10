@@ -1,7 +1,10 @@
 package suite
 
 import (
+	"context"
+	"crypto/rand"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,15 +21,21 @@ type TestSuite struct {
 	config *config.Config
 	client *nexus.Client
 	logger *logger.Logger
-	files  []FileInfo // list of files to upload/download
-	mu     sync.Mutex
+	files  []FileInfo
 }
 
-// FileInfo stores information about uploaded files
+// FileInfo stores information about a test file
 type FileInfo struct {
 	Path string
-	Data []byte
 	Size int64
+}
+
+// xferResult is the outcome of a single upload or download
+type xferResult struct {
+	duration   time.Duration
+	bytes      int64
+	statusCode int
+	err        error
 }
 
 // NewTestSuite creates a new test suite
@@ -39,17 +48,13 @@ func NewTestSuite(cfg *config.Config, client *nexus.Client, log *logger.Logger) 
 	}
 }
 
-// Prepare generates test files
+// Prepare generates test file paths
 func (ts *TestSuite) Prepare() error {
 	ts.logger.Infof("Preparing %d test files with size %d bytes each...", ts.config.NumFiles, ts.config.FileSize)
 
 	for i := 0; i < ts.config.NumFiles; i++ {
-		fileData := data.GenerateRandomFile(ts.config.FileSize)
-		filePath := data.GenerateFilePath(ts.config.Format, i+1)
-
 		ts.files = append(ts.files, FileInfo{
-			Path: filePath,
-			Data: fileData,
+			Path: data.GenerateFilePath(ts.config.Format, i+1),
 			Size: ts.config.FileSize,
 		})
 	}
@@ -58,110 +63,95 @@ func (ts *TestSuite) Prepare() error {
 	return nil
 }
 
-// RunUploadTest runs the upload test with multiple threads
-func (ts *TestSuite) RunUploadTest() (*metrics.AggregatedMetrics, error) {
-	ts.logger.Infof("Starting upload test with %d threads, %d files...", ts.config.NumThreads, len(ts.files))
+func (ts *TestSuite) RunUploadTest(ctx context.Context) (*metrics.AggregatedMetrics, error) {
+	return ts.runTransfers(ctx, metrics.OperationUpload, func(ctx context.Context, f FileInfo, t *progressTracker) xferResult {
+		r := ts.client.Upload(ctx, f.Path, f.Size, t.wrapReader(io.LimitReader(rand.Reader, f.Size)))
+		return xferResult{r.Duration, r.Bytes, r.StatusCode, r.Error}
+	})
+}
+
+func (ts *TestSuite) RunDownloadTest(ctx context.Context) (*metrics.AggregatedMetrics, error) {
+	return ts.runTransfers(ctx, metrics.OperationDownload, func(ctx context.Context, f FileInfo, t *progressTracker) xferResult {
+		r := ts.client.Download(ctx, f.Path, t.writer())
+		return xferResult{r.Duration, r.Bytes, r.StatusCode, r.Error}
+	})
+}
+
+// runTransfers is the shared engine for upload and download tests.
+// do is called once per file in a goroutine and describes the actual transfer.
+func (ts *TestSuite) runTransfers(
+	ctx context.Context,
+	op metrics.OperationType,
+	do func(context.Context, FileInfo, *progressTracker) xferResult,
+) (*metrics.AggregatedMetrics, error) {
+	ts.logger.Infof("Starting %s test with %d threads, %d files...", op, ts.config.NumThreads, len(ts.files))
 
 	collector := metrics.NewCollector()
 	var wg sync.WaitGroup
-	var activeWorkers int32
 	sem := make(chan struct{}, ts.config.NumThreads)
-	fileIndex := int32(0)
+	var fileIndex int32
+	verboseLines := make([]string, len(ts.files))
 
-	// Start worker goroutines
-	for w := 0; w < ts.config.NumThreads; w++ {
+	tracker := newProgressTracker(int64(len(ts.files)) * ts.config.FileSize)
+	stopProgress := func() {}
+	if ts.config.Verbosity <= 1 {
+		stopProgress = tracker.run(ctx, string(op))
+	}
+
+	for {
+		idx := atomic.AddInt32(&fileIndex, 1) - 1
+		if idx >= int32(len(ts.files)) || ctx.Err() != nil {
+			break
+		}
+		sem <- struct{}{}
 		wg.Add(1)
-		go func(workerID int) {
+		go func(i int) {
 			defer wg.Done()
-			atomic.AddInt32(&activeWorkers, 1)
-			defer atomic.AddInt32(&activeWorkers, -1)
+			defer func() { <-sem }()
 
-			for {
-				idx := atomic.AddInt32(&fileIndex, 1) - 1
-				if idx >= int32(len(ts.files)) {
-					break
+			file := ts.files[i]
+			ts.logger.Debugf("[%s] file %d/%d: %s", op, i+1, len(ts.files), file.Path)
+
+			r := do(ctx, file, tracker)
+			if r.err != nil {
+				ts.logger.Warnf("[%s] failed: %s: %v", op, file.Path, r.err)
+				collector.Record(r.duration, r.bytes, false, r.statusCode)
+				if ts.config.VerboseMetrics {
+					verboseLines[i] = metrics.FormatFileMetric(file.Path, false, r.duration, 0)
 				}
-
-				sem <- struct{}{}
-				go func(fileIdx int) {
-					defer func() { <-sem }()
-
-					file := ts.files[fileIdx]
-					ts.logger.Debugf("[Worker %d] Uploading file %d: %s (%d bytes)", workerID, fileIdx+1, file.Path, file.Size)
-
-					result := ts.client.Upload(file.Path, file.Data)
-
-					if result.Error != nil {
-						ts.logger.Warnf("[Worker %d] Upload failed for %s: %v", workerID, file.Path, result.Error)
-						collector.Record(result.Duration, result.Size, false, result.StatusCode)
-					} else {
-						ts.logger.Debugf("[Worker %d] Upload successful for %s in %v (%.2f Mbps)", workerID, file.Path, result.Duration, calculateMbps(result.Size, result.Duration))
-						collector.Record(result.Duration, result.Size, true, result.StatusCode)
-					}
-				}(int(idx))
+			} else {
+				ts.logger.Debugf("[%s] OK: %s in %v (%.2f MB/s)", op, file.Path, r.duration, calculateMbps(r.bytes, r.duration))
+				collector.Record(r.duration, r.bytes, true, r.statusCode)
+				if ts.config.VerboseMetrics {
+					verboseLines[i] = metrics.FormatFileMetric(file.Path, true, r.duration, r.bytes)
+				}
 			}
-		}(w)
+		}(int(idx))
 	}
 
 	wg.Wait()
-	ts.logger.Infof("Upload test completed")
+	stopProgress()
 
-	return collector.GetAggregated(metrics.OperationUpload), nil
-}
-
-// RunDownloadTest runs the download test with multiple threads
-func (ts *TestSuite) RunDownloadTest() (*metrics.AggregatedMetrics, error) {
-	ts.logger.Infof("Starting download test with %d threads, %d files...", ts.config.NumThreads, len(ts.files))
-
-	collector := metrics.NewCollector()
-	var wg sync.WaitGroup
-	var activeWorkers int32
-	sem := make(chan struct{}, ts.config.NumThreads)
-	fileIndex := int32(0)
-
-	// Start worker goroutines
-	for w := 0; w < ts.config.NumThreads; w++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			atomic.AddInt32(&activeWorkers, 1)
-			defer atomic.AddInt32(&activeWorkers, -1)
-
-			for {
-				idx := atomic.AddInt32(&fileIndex, 1) - 1
-				if idx >= int32(len(ts.files)) {
-					break
-				}
-
-				sem <- struct{}{}
-				go func(fileIdx int) {
-					defer func() { <-sem }()
-
-					file := ts.files[fileIdx]
-					ts.logger.Debugf("[Worker %d] Downloading file %d: %s", workerID, fileIdx+1, file.Path)
-
-					result := ts.client.Download(file.Path)
-
-					if result.Error != nil {
-						ts.logger.Warnf("[Worker %d] Download failed for %s: %v", workerID, file.Path, result.Error)
-						collector.Record(result.Duration, 0, false, result.StatusCode)
-					} else {
-						ts.logger.Debugf("[Worker %d] Download successful for %s in %v (%.2f Mbps)", workerID, file.Path, result.Duration, calculateMbps(result.Size, result.Duration))
-						collector.Record(result.Duration, result.Size, true, result.StatusCode)
-					}
-				}(int(idx))
+	if ts.config.VerboseMetrics {
+		for _, line := range verboseLines {
+			if line != "" {
+				fmt.Println(line)
 			}
-		}(w)
+		}
 	}
 
-	wg.Wait()
-	ts.logger.Infof("Download test completed")
+	if ctx.Err() != nil {
+		ts.logger.Infof("%s test interrupted", op)
+	} else {
+		ts.logger.Infof("%s test completed", op)
+	}
 
-	return collector.GetAggregated(metrics.OperationDownload), nil
+	return collector.GetAggregated(op), nil
 }
 
-// Cleanup deletes uploaded files if not keeping them
-func (ts *TestSuite) Cleanup() error {
+// Cleanup deletes uploaded files. Pass context.Background() to ensure cleanup
+// always runs even after the test context is cancelled.
+func (ts *TestSuite) Cleanup(ctx context.Context) error {
 	if ts.config.KeepFiles {
 		ts.logger.Infof("Keeping uploaded files as requested")
 		return nil
@@ -171,26 +161,26 @@ func (ts *TestSuite) Cleanup() error {
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, ts.config.NumThreads)
-	errorCount := 0
-	var mu sync.Mutex
+	var (
+		errorCount int
+		mu         sync.Mutex
+	)
 
 	for i, file := range ts.files {
 		wg.Add(1)
-		go func(fileIdx int, filePath string) {
+		go func(idx int, path string) {
 			defer wg.Done()
-
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			ts.logger.Debugf("Deleting file %d: %s", fileIdx+1, filePath)
-
-			if err := ts.client.Delete(filePath); err != nil {
-				ts.logger.Warnf("Failed to delete file %s: %v", filePath, err)
+			ts.logger.Debugf("Deleting file %d: %s", idx+1, path)
+			if err := ts.client.Delete(ctx, path); err != nil {
+				ts.logger.Warnf("Failed to delete %s: %v", path, err)
 				mu.Lock()
 				errorCount++
 				mu.Unlock()
 			} else {
-				ts.logger.Debugf("Deleted file %s", filePath)
+				ts.logger.Debugf("Deleted %s", path)
 			}
 		}(i, file.Path)
 	}
@@ -206,12 +196,9 @@ func (ts *TestSuite) Cleanup() error {
 	return nil
 }
 
-// calculateMbps calculates throughput in Mbps
 func calculateMbps(bytes int64, duration time.Duration) float64 {
 	if duration <= 0 {
 		return 0
 	}
-	megabytes := float64(bytes) / (1024 * 1024)
-	seconds := duration.Seconds()
-	return megabytes / seconds
+	return float64(bytes) / 1_000_000 / duration.Seconds()
 }

@@ -11,9 +11,12 @@
 *.so
 *.out
 nexus-perf
+nexus-perf*
 nexus-perf.exe
+nexus-perf-*.exe
 dist/
 build/
 *.log
 test-output/
 temp/
+.claude/

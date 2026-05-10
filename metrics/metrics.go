@@ -21,7 +21,7 @@ type ResultMetrics struct {
 	BytesCount     int64
 	StatusCode     int
 	Success        bool
-	ThroughputMbps float64
+	ThroughputMBps float64
 }
 
 // AggregatedMetrics holds aggregated metrics for all operations
@@ -45,7 +45,7 @@ type AggregatedMetrics struct {
 	P95Duration time.Duration
 	P99Duration time.Duration
 
-	OverallThroughputMbps float64
+	OverallThroughputMBps float64
 	SuccessRate           float64
 }
 
@@ -73,7 +73,7 @@ func (c *Collector) Record(duration time.Duration, bytes int64, success bool, st
 		BytesCount:     bytes,
 		StatusCode:     statusCode,
 		Success:        success,
-		ThroughputMbps: throughput,
+		ThroughputMBps: throughput,
 	})
 }
 
@@ -88,12 +88,13 @@ func (c *Collector) GetAggregated(opType OperationType) *AggregatedMetrics {
 		}
 	}
 
-	// Calculate aggregates
-	totalBytes := int64(0)
-	totalDuration := time.Duration(0)
-	successCount := 0
-	durations := make([]time.Duration, 0, len(c.metrics))
-	throughputs := make([]float64, 0, len(c.metrics))
+	var (
+		totalBytes    int64
+		totalDuration time.Duration
+		successCount  int
+		durations     = make([]time.Duration, 0, len(c.metrics))
+		throughputs   = make([]float64, 0, len(c.metrics))
+	)
 
 	for _, m := range c.metrics {
 		if m.Success {
@@ -102,7 +103,7 @@ func (c *Collector) GetAggregated(opType OperationType) *AggregatedMetrics {
 		totalBytes += m.BytesCount
 		totalDuration += m.Duration
 		durations = append(durations, m.Duration)
-		throughputs = append(throughputs, m.ThroughputMbps)
+		throughputs = append(throughputs, m.ThroughputMBps)
 	}
 
 	// Sort for percentile calculations
@@ -127,25 +128,31 @@ func (c *Collector) GetAggregated(opType OperationType) *AggregatedMetrics {
 		P50Duration:           percentileDuration(durations, 50),
 		P95Duration:           percentileDuration(durations, 95),
 		P99Duration:           percentileDuration(durations, 99),
-		OverallThroughputMbps: calculateThroughput(totalBytes, totalDuration),
+		OverallThroughputMBps: calculateThroughput(totalBytes, totalDuration),
 		SuccessRate:           float64(successCount) / float64(len(c.metrics)) * 100,
 	}
 }
 
-// calculateThroughput calculates throughput in Mbps
+// formatDuration formats a duration to 2 decimal places with the appropriate unit.
+func formatDuration(d time.Duration) string {
+	switch {
+	case d >= time.Second:
+		return fmt.Sprintf("%.2fs", d.Seconds())
+	case d >= time.Millisecond:
+		return fmt.Sprintf("%.2fms", float64(d)/float64(time.Millisecond))
+	case d >= time.Microsecond:
+		return fmt.Sprintf("%.2fµs", float64(d)/float64(time.Microsecond))
+	default:
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	}
+}
+
+// calculateThroughput calculates throughput in MB/s (SI megabytes per second)
 func calculateThroughput(bytes int64, duration time.Duration) float64 {
 	if duration <= 0 {
 		return 0
 	}
-
-	// Convert bytes to megabytes
-	megabytes := float64(bytes) / (1024 * 1024)
-
-	// Convert duration to seconds
-	seconds := duration.Seconds()
-
-	// Mbps = megabytes / seconds
-	return megabytes / seconds
+	return float64(bytes) / 1_000_000 / duration.Seconds()
 }
 
 // calculateAverage calculates average throughput
@@ -198,23 +205,89 @@ Total Operations:       %d
 Success:                %d (%.2f%%)
 Failures:               %d
 Total Data:             %.2f MB
-Total Duration:         %v
+Total Duration:         %s
 
 Throughput:
-  Overall:              %.2f Mbps
-  Average:              %.2f Mbps
-  Min:                  %.2f Mbps
-  Max:                  %.2f Mbps
+  Overall:              %.2f MB/s
+  Average:              %.2f MB/s
+  Min:                  %.2f MB/s
+  Max:                  %.2f MB/s
 
 Duration:
-  Average:              %v
-  Min:                  %v
-  Max:                  %v
-  P50:                  %v
-  P95:                  %v
-  P99:                  %v
+  Average:              %s
+  Min:                  %s
+  Max:                  %s
+  P50:                  %s
+  P95:                  %s
+  P99:                  %s
 `, m.OperationType, m.TotalOperations, m.SuccessCount, m.SuccessRate, m.FailureCount,
-		float64(m.TotalBytes)/(1024*1024), m.TotalDuration,
-		m.OverallThroughputMbps, m.AvgThroughput, m.MinThroughput, m.MaxThroughput,
-		m.AvgDuration, m.MinDuration, m.MaxDuration, m.P50Duration, m.P95Duration, m.P99Duration)
+		float64(m.TotalBytes)/1_000_000, formatDuration(m.TotalDuration),
+		m.OverallThroughputMBps, m.AvgThroughput, m.MinThroughput, m.MaxThroughput,
+		formatDuration(m.AvgDuration), formatDuration(m.MinDuration), formatDuration(m.MaxDuration),
+		formatDuration(m.P50Duration), formatDuration(m.P95Duration), formatDuration(m.P99Duration))
+}
+
+// FormatAsTable returns a human-readable table of results
+func (m *AggregatedMetrics) FormatAsTable() string {
+	return fmt.Sprintf(`
+================================================================================
+                      %s PERFORMANCE METRICS
+================================================================================
+
+OPERATIONS
+--------------------------------------------------------------------------------
+  Total Operations:           %d
+  Success:                    %d (%.2f%%)
+  Failures:                   %d
+  Total Data Volume:          %.2f MB
+
+THROUGHPUT (MB/s)
+--------------------------------------------------------------------------------
+  Overall:                    %.2f MB/s
+  Average:                    %.2f MB/s
+  Min:                        %.2f MB/s
+  Max:                        %.2f MB/s
+
+DURATION / LATENCY
+--------------------------------------------------------------------------------
+  Average Duration:           %s
+  Min Duration:               %s
+  Max Duration:               %s
+  P50 (Median):               %s
+  P95 (95th Percentile):      %s
+  P99 (99th Percentile):      %s
+  Total Test Duration:        %s
+
+================================================================================
+
+`,
+		m.OperationType,
+		m.TotalOperations, m.SuccessCount, m.SuccessRate, m.FailureCount,
+		float64(m.TotalBytes)/1_000_000,
+		m.OverallThroughputMBps, m.AvgThroughput, m.MinThroughput, m.MaxThroughput,
+		formatDuration(m.AvgDuration), formatDuration(m.MinDuration), formatDuration(m.MaxDuration),
+		formatDuration(m.P50Duration), formatDuration(m.P95Duration), formatDuration(m.P99Duration),
+		formatDuration(m.TotalDuration))
+}
+
+// FormatAsCompactTable returns a compact single-line table format
+func (m *AggregatedMetrics) FormatAsCompactTable() string {
+	return fmt.Sprintf(`
+%-12s │ Ops: %5d │ Success: %6.2f%% │ Total: %9.2f MB │ Overall: %7.2f MB/s │ Avg: %10s │ P99: %10s
+`, m.OperationType, m.TotalOperations, m.SuccessRate,
+		float64(m.TotalBytes)/1_000_000, m.OverallThroughputMBps,
+		formatDuration(m.AvgDuration), formatDuration(m.P99Duration))
+}
+
+// FormatFileMetric returns a formatted single file metric string
+func FormatFileMetric(fileName string, success bool, duration time.Duration, bytes int64) string {
+	status := "✓"
+	if !success {
+		status = "✗"
+	}
+
+	mbps := calculateThroughput(bytes, duration)
+	mb := float64(bytes) / 1_000_000
+
+	return fmt.Sprintf("  [%s] %s | %.3f MB | %s | %.2f MB/s", status, fileName, mb, formatDuration(duration), mbps)
 }

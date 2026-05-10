@@ -1,8 +1,12 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -14,6 +18,8 @@ import (
 )
 
 var (
+	appVersion = "dev" // overridden at link time via -X github.com/company/nexus-perf/cmd.appVersion
+
 	// Global flags
 	nexusEndpoint  string
 	username       string
@@ -29,16 +35,16 @@ var (
 	skipUpload     bool
 	skipDownload   bool
 	keepFiles      bool
+	logFile        string
+	verboseMetrics bool
 
-	// Root command
 	rootCmd = &cobra.Command{
 		Use:     "nexus-perf",
 		Short:   "Nexus Repository Performance Test Tool",
 		Long:    "Enterprise-grade performance testing tool for Sonatype Nexus Repository",
-		Version: "1.0.0",
+		Version: appVersion,
 	}
 
-	// Test command
 	testCmd = &cobra.Command{
 		Use:   "test",
 		Short: "Run performance tests",
@@ -46,14 +52,12 @@ var (
 		RunE:  runTest,
 	}
 
-	// Upload only command
 	uploadCmd = &cobra.Command{
 		Use:   "upload",
 		Short: "Run upload test only",
 		RunE:  runUploadTest,
 	}
 
-	// Download only command
 	downloadCmd = &cobra.Command{
 		Use:   "download",
 		Short: "Run download test only",
@@ -69,7 +73,6 @@ func Execute() error {
 func init() {
 	rootCmd.AddCommand(testCmd, uploadCmd, downloadCmd)
 
-	// Define flags
 	testCmd.Flags().StringVar(&nexusEndpoint, "nexus-endpoint", "", "Nexus repository endpoint URL")
 	testCmd.Flags().StringVar(&username, "username", "", "Nexus username")
 	testCmd.Flags().StringVar(&password, "password", "", "Nexus password")
@@ -84,26 +87,30 @@ func init() {
 	testCmd.Flags().BoolVar(&skipUpload, "skip-upload", false, "Skip upload test")
 	testCmd.Flags().BoolVar(&skipDownload, "skip-download", false, "Skip download test")
 	testCmd.Flags().BoolVar(&keepFiles, "keep-files", false, "Keep uploaded files after test")
+	testCmd.Flags().StringVar(&logFile, "log-file", "", "Path to log file (logs to stdout if not specified)")
+	testCmd.Flags().BoolVar(&verboseMetrics, "verbose-metrics", false, "Print per-file metrics (time and speed for each file)")
 
-	// Make environment variables override CLI flags
+	// Bind testCmd flags to viper so NEXUS_PERF_* env vars take precedence
 	viper.SetEnvPrefix("NEXUS_PERF")
 	viper.AutomaticEnv()
-	viper.BindPFlag("nexus_endpoint", testCmd.Flags().Lookup("nexus-endpoint"))
-	viper.BindPFlag("username", testCmd.Flags().Lookup("username"))
-	viper.BindPFlag("password", testCmd.Flags().Lookup("password"))
-	viper.BindPFlag("repository_name", testCmd.Flags().Lookup("repository-name"))
-	viper.BindPFlag("format", testCmd.Flags().Lookup("format"))
-	viper.BindPFlag("ca_path", testCmd.Flags().Lookup("ca-path"))
-	viper.BindPFlag("skip_verify", testCmd.Flags().Lookup("skip-verify"))
-	viper.BindPFlag("file_size", testCmd.Flags().Lookup("file-size"))
-	viper.BindPFlag("num_files", testCmd.Flags().Lookup("num-files"))
-	viper.BindPFlag("num_threads", testCmd.Flags().Lookup("num-threads"))
-	viper.BindPFlag("verbosity", testCmd.Flags().Lookup("verbosity"))
-	viper.BindPFlag("skip_upload", testCmd.Flags().Lookup("skip-upload"))
-	viper.BindPFlag("skip_download", testCmd.Flags().Lookup("skip-download"))
-	viper.BindPFlag("keep_files", testCmd.Flags().Lookup("keep-files"))
+	_ = viper.BindPFlag("nexus_endpoint", testCmd.Flags().Lookup("nexus-endpoint"))
+	_ = viper.BindPFlag("username", testCmd.Flags().Lookup("username"))
+	_ = viper.BindPFlag("password", testCmd.Flags().Lookup("password"))
+	_ = viper.BindPFlag("repository_name", testCmd.Flags().Lookup("repository-name"))
+	_ = viper.BindPFlag("format", testCmd.Flags().Lookup("format"))
+	_ = viper.BindPFlag("ca_path", testCmd.Flags().Lookup("ca-path"))
+	_ = viper.BindPFlag("skip_verify", testCmd.Flags().Lookup("skip-verify"))
+	_ = viper.BindPFlag("file_size", testCmd.Flags().Lookup("file-size"))
+	_ = viper.BindPFlag("num_files", testCmd.Flags().Lookup("num-files"))
+	_ = viper.BindPFlag("num_threads", testCmd.Flags().Lookup("num-threads"))
+	_ = viper.BindPFlag("verbosity", testCmd.Flags().Lookup("verbosity"))
+	_ = viper.BindPFlag("skip_upload", testCmd.Flags().Lookup("skip-upload"))
+	_ = viper.BindPFlag("skip_download", testCmd.Flags().Lookup("skip-download"))
+	_ = viper.BindPFlag("keep_files", testCmd.Flags().Lookup("keep-files"))
+	_ = viper.BindPFlag("log_file", testCmd.Flags().Lookup("log-file"))
+	_ = viper.BindPFlag("verbose_metrics", testCmd.Flags().Lookup("verbose-metrics"))
 
-	// Copy flags to other commands
+	// Copy flags to upload and download subcommands
 	for _, cmd := range []*cobra.Command{uploadCmd, downloadCmd} {
 		cmd.Flags().StringVar(&nexusEndpoint, "nexus-endpoint", "", "Nexus repository endpoint URL")
 		cmd.Flags().StringVar(&username, "username", "", "Nexus username")
@@ -115,103 +122,191 @@ func init() {
 		cmd.Flags().Int64Var(&fileSize, "file-size", 1024*1024, "Test file size in bytes")
 		cmd.Flags().IntVar(&numFiles, "num-files", 10, "Number of test files")
 		cmd.Flags().IntVar(&numThreads, "num-threads", 4, "Number of concurrent threads")
-		cmd.Flags().IntVar(&verbosity, "verbosity", 1, "Verbosity level (0=error, 1=info, 2=debug)")
+		cmd.Flags().IntVar(&verbosity, "verbosity", 1, "Verbosity level (0=error, 1=info, 2=debug, 3=trace)")
 		cmd.Flags().BoolVar(&keepFiles, "keep-files", false, "Keep uploaded files after test")
+		cmd.Flags().StringVar(&logFile, "log-file", "", "Path to log file (logs to stdout if not specified)")
+		cmd.Flags().BoolVar(&verboseMetrics, "verbose-metrics", false, "Print per-file metrics")
 	}
 }
 
 func runTest(cmd *cobra.Command, args []string) error {
-	// Load configuration from environment and flags
-	cfg, err := config.New()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Load base config from env vars (no validation yet — CLI flags may supply missing values).
+	cfg := config.Load()
+
+	// Apply only flags the user explicitly passed. Skipping unset flags prevents cobra
+	// defaults from overriding NEXUS_PERF_* environment variables.
+	if cmd.Flags().Changed("nexus-endpoint") {
+		cfg.NexusEndpoint = nexusEndpoint
+	}
+	if cmd.Flags().Changed("username") {
+		cfg.Username = username
+	}
+	if cmd.Flags().Changed("password") {
+		cfg.Password = password
+	}
+	if cmd.Flags().Changed("repository-name") {
+		cfg.RepositoryName = repositoryName
+	}
+	if cmd.Flags().Changed("format") {
+		cfg.Format = config.RepositoryFormat(strings.ToUpper(format))
+	}
+	if cmd.Flags().Changed("ca-path") {
+		cfg.CAPath = caPath
+	}
+	if cmd.Flags().Changed("skip-verify") {
+		cfg.SkipVerify = skipVerify
+	}
+	if cmd.Flags().Changed("file-size") {
+		cfg.FileSize = fileSize
+	}
+	if cmd.Flags().Changed("num-files") {
+		cfg.NumFiles = numFiles
+	}
+	if cmd.Flags().Changed("num-threads") {
+		cfg.NumThreads = numThreads
+	}
+	if cmd.Flags().Changed("verbosity") {
+		cfg.Verbosity = verbosity
+	}
+	if cmd.Flags().Changed("keep-files") {
+		cfg.KeepFiles = keepFiles
+	}
+	if cmd.Flags().Changed("log-file") {
+		cfg.LogFile = logFile
+	}
+	if cmd.Flags().Changed("verbose-metrics") {
+		cfg.VerboseMetrics = verboseMetrics
+	}
+	// skip-upload/skip-download are also set programmatically by the upload/download
+	// subcommands, so always apply them (OR with any env-var value already loaded).
+	cfg.SkipUpload = cfg.SkipUpload || skipUpload
+	cfg.SkipDownload = cfg.SkipDownload || skipDownload
+
+	if strings.HasPrefix(cfg.NexusEndpoint, "http://") {
+		fmt.Fprintln(os.Stderr, "WARNING: endpoint uses plain HTTP — credentials will be transmitted unencrypted")
+	}
+
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return err
+	}
+
+	// Create logger with optional file output
+	var (
+		log *logger.Logger
+		err error
+	)
+	if cfg.LogFile != "" {
+		log, err = logger.NewWithFile(cfg.Verbosity, cfg.LogFile)
+	} else {
+		log, err = logger.New(cfg.Verbosity)
+	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Invalid configuration: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error initializing logger: %v\n", err)
 		return err
 	}
+	defer func() { _ = log.Sync() }()
 
-	// Apply CLI flags if provided
-	flags := map[string]interface{}{
-		"nexus-endpoint":  nexusEndpoint,
-		"username":        username,
-		"password":        password,
-		"repository-name": repositoryName,
-		"format":          format,
-		"ca-path":         caPath,
-		"skip-verify":     skipVerify,
-		"file-size":       fileSize,
-		"num-files":       numFiles,
-		"num-threads":     numThreads,
-		"verbosity":       verbosity,
-		"skip-upload":     skipUpload,
-		"skip-download":   skipDownload,
-		"keep-files":      keepFiles,
-	}
-
-	// Filter out empty flags
-	for k, v := range flags {
-		switch v := v.(type) {
-		case string:
-			if v == "" {
-				delete(flags, k)
-			}
-		}
-	}
-
-	if err := cfg.ApplyFlags(flags); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Invalid configuration: %v\n", err)
-		return err
-	}
-
-	// Create logger
-	log := logger.New(cfg.Verbosity)
-	defer log.Sync()
-
-	log.Infof("Starting Nexus Performance Test")
-	log.Infof("Configuration: %s", cfg)
+	printBanner(cfg)
 
 	// Create Nexus client
 	client, err := nexus.NewClient(cfg)
 	if err != nil {
-		log.Fatalf("Failed to create Nexus client: %v", err)
+		fmt.Fprintf(os.Stderr, "  [FAIL] Could not initialise client: %v\n\n", err)
 		return err
 	}
 	defer client.Close()
 
-	// Create test suite
+	// Pre-flight: connectivity
+	fmt.Print("  Checking connectivity ... ")
+	if err := client.Ping(ctx); err != nil {
+		fmt.Printf("FAIL\n\n  Error: %v\n\n", err)
+		return err
+	}
+	fmt.Println("OK")
+
+	// Pre-flight: credentials + repository
+	fmt.Print("  Checking credentials & repository ... ")
+	if err := client.CheckRepository(ctx); err != nil {
+		fmt.Printf("FAIL\n\n  Error: %v\n\n", err)
+		return err
+	}
+	fmt.Println("OK")
+
+	fmt.Println()
+	log.Infof("Pre-flight checks passed, starting test")
+
 	testSuite := suite.NewTestSuite(cfg, client, log)
 
-	// Prepare test files
 	if err := testSuite.Prepare(); err != nil {
 		log.Fatalf("Failed to prepare test files: %v", err)
 		return err
 	}
 
-	// Run upload test
 	if !cfg.SkipUpload {
-		uploadMetrics, err := testSuite.RunUploadTest()
+		uploadMetrics, err := testSuite.RunUploadTest(ctx)
 		if err != nil {
 			log.Errorf("Upload test failed: %v", err)
+		} else if cfg.LogFile != "" {
+			fmt.Print(uploadMetrics.FormatAsTable())
 		} else {
 			log.Infof(uploadMetrics.String())
 		}
 	}
 
-	// Run download test
 	if !cfg.SkipDownload {
-		downloadMetrics, err := testSuite.RunDownloadTest()
+		downloadMetrics, err := testSuite.RunDownloadTest(ctx)
 		if err != nil {
 			log.Errorf("Download test failed: %v", err)
+		} else if cfg.LogFile != "" {
+			fmt.Print(downloadMetrics.FormatAsTable())
 		} else {
 			log.Infof(downloadMetrics.String())
 		}
 	}
 
-	// Cleanup
-	if err := testSuite.Cleanup(); err != nil {
+	// Fresh context for cleanup so it always runs even after a Ctrl+C.
+	if err := testSuite.Cleanup(context.Background()); err != nil {
 		log.Warnf("Cleanup error: %v", err)
 	}
 
 	log.Infof("Test completed successfully")
 	return nil
+}
+
+func printBanner(cfg *config.Config) {
+	tests := []string{}
+	if !cfg.SkipUpload {
+		tests = append(tests, "upload")
+	}
+	if !cfg.SkipDownload {
+		tests = append(tests, "download")
+	}
+	testList := "upload + download"
+	if len(tests) == 1 {
+		testList = tests[0]
+	}
+
+	fmt.Println()
+	fmt.Println("================================================================================")
+	fmt.Println("                     Nexus Repository Performance Test")
+	fmt.Println("================================================================================")
+	fmt.Printf("  Endpoint:      %s\n", cfg.NexusEndpoint)
+	fmt.Printf("  Repository:    %s (%s)\n", cfg.RepositoryName, cfg.Format)
+	fmt.Printf("  Username:      %s\n", cfg.Username)
+	fmt.Printf("  Files:         %d x %.2f MB  (total %.2f MB)\n",
+		cfg.NumFiles,
+		float64(cfg.FileSize)/1_000_000,
+		float64(cfg.FileSize)*float64(cfg.NumFiles)/1_000_000,
+	)
+	fmt.Printf("  Threads:       %d\n", cfg.NumThreads)
+	fmt.Printf("  Tests:         %s\n", testList)
+	fmt.Println("================================================================================")
+	fmt.Println()
+	fmt.Println("Pre-flight checks:")
 }
 
 func runUploadTest(cmd *cobra.Command, args []string) error {

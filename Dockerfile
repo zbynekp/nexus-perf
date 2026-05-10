@@ -1,45 +1,47 @@
-# Multi-stage build
-FROM golang:1.21-alpine AS builder
+# syntax=docker/dockerfile:1
+# Multi-stage build: compile on golang:1.25-alpine (Alpine 3.21), run on alpine:3.21.
+FROM golang:1.25-alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache git make
+# git is needed by go mod download for VCS-based dependencies.
+RUN apk add --no-cache git
 
 WORKDIR /app
 
-# Copy go mod files
 COPY go.mod go.sum ./
-
-# Download dependencies
 RUN go mod download
 
-# Copy source code
 COPY . .
 
-# Build application
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v -o nexus-perf
+ARG VERSION=dev
+ARG BUILD_TIME=unknown
+# TARGETARCH is injected by Docker BuildKit when building multi-platform images
+# (docker buildx build --platform linux/amd64,linux/arm64).
+# Falls back to amd64 for plain docker build.
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
+    -ldflags "-X github.com/company/nexus-perf/cmd.appVersion=${VERSION} \
+              -X github.com/company/nexus-perf/cmd.buildTime=${BUILD_TIME}" \
+    -o nexus-perf .
 
-# Runtime stage
-FROM alpine:3.18
+# Runtime stage — keep Alpine version in sync with the builder base image.
+FROM alpine:3.21
 
-# Install runtime dependencies
 RUN apk add --no-cache ca-certificates
+
+# Create non-root user before copying files so ownership can be set in one step.
+RUN addgroup -g 1000 nexus-perf && \
+    adduser  -D -u 1000 -G nexus-perf nexus-perf
 
 WORKDIR /app
 
-# Copy binary from builder
-COPY --from=builder /app/nexus-perf /app/
-
-# Create non-root user for security
-RUN addgroup -g 1000 nexus-perf && \
-    adduser -D -u 1000 -G nexus-perf nexus-perf
+COPY --from=builder --chown=nexus-perf:nexus-perf /app/nexus-perf /app/
 
 USER nexus-perf
 
-# Set entrypoint
 ENTRYPOINT ["/app/nexus-perf"]
 CMD ["--help"]
 
-# Labels for metadata
-LABEL maintainer="Performance Testing Team"
-LABEL description="Nexus Repository Performance Testing Tool"
-LABEL version="1.0.0"
+ARG VERSION=dev
+LABEL org.opencontainers.image.authors="Performance Testing Team"
+LABEL org.opencontainers.image.description="Nexus Repository Performance Testing Tool"
+LABEL org.opencontainers.image.version="${VERSION}"

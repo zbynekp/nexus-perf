@@ -1,13 +1,11 @@
-version: '3.8'
-
 services:
   nexus:
-    image: sonatype/nexus3:latest
+    # Pin to a specific version for reproducibility.
+    # Check https://hub.docker.com/r/sonatype/nexus3/tags for the latest stable.
+    image: sonatype/nexus3:3.72.0
     container_name: nexus-test
     ports:
       - "8081:8081"
-    environment:
-      - NEXUS_CONTEXT=nexus
     volumes:
       - nexus-data:/nexus-data
     healthcheck:
@@ -28,16 +26,17 @@ services:
       nexus:
         condition: service_healthy
     environment:
+      # Endpoint must match the Nexus service name and port — no NEXUS_CONTEXT suffix.
       - NEXUS_PERF_NEXUS_ENDPOINT=http://nexus:8081
       - NEXUS_PERF_USERNAME=admin
-      - NEXUS_PERF_PASSWORD=admin123
+      # Override with: docker compose run -e NEXUS_PERF_PASSWORD=... nexus-perf-test
+      - NEXUS_PERF_PASSWORD=${NEXUS_PERF_PASSWORD:-admin123}
       - NEXUS_PERF_REPOSITORY_NAME=maven-releases
       - NEXUS_PERF_FORMAT=MAVEN
       - NEXUS_PERF_NUM_FILES=50
       - NEXUS_PERF_NUM_THREADS=8
-      - NEXUS_PERF_FILE_SIZE=1048576
+      - NEXUS_PERF_FILE_SIZE=1000000
       - NEXUS_PERF_VERBOSITY=2
-      - NEXUS_PERF_SKIP_VERIFY=true
     networks:
       - nexus-network
     command: test
