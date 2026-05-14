@@ -3,7 +3,7 @@
 PKG         := github.com/company/nexus-perf
 BINARY_NAME := nexus-perf
 GO          := go
-VERSION     ?= dev
+VERSION     ?= 0.1.0
 
 # docker-run defaults (override on the command line)
 NEXUS_ENDPOINT ?=
@@ -30,13 +30,13 @@ build:
 	@echo "Building $(BINARY_NAME) for Linux amd64..."
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -v \
 		-ldflags "-X $(PKG)/cmd.appVersion=$(VERSION) -X $(PKG)/cmd.buildTime=$$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-		-o $(BINARY_NAME)-linux .
-	@echo "Build complete: $(BINARY_NAME)-linux"
+		-o $(BINARY_NAME)-linux-amd64-$(VERSION) .
+	@echo "Build complete: $(BINARY_NAME)-linux-amd64-$(VERSION)"
 
 clean:
 	@echo "Cleaning build artifacts..."
 	$(GO) clean
-	rm -f $(BINARY_NAME) $(BINARY_NAME)-linux $(BINARY_NAME)-macos $(BINARY_NAME).exe
+	rm -f $(BINARY_NAME)-* $(BINARY_NAME) $(BINARY_NAME).exe
 	rm -f coverage.out coverage.html
 	rm -f *.log
 	@echo "Clean complete"

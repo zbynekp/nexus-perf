@@ -27,9 +27,11 @@ func newProgressTracker(total int64) *progressTracker {
 // every second. Call the returned stop function after all transfers finish.
 func (p *progressTracker) run(ctx context.Context, op string) func() {
 	stop := make(chan struct{})
+	done := make(chan struct{})
 	var once sync.Once
 	p.printLine(op) // show 0% immediately so the line is visible from the start
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
@@ -46,7 +48,10 @@ func (p *progressTracker) run(ctx context.Context, op string) func() {
 			}
 		}
 	}()
-	return func() { once.Do(func() { close(stop) }) }
+	return func() {
+		once.Do(func() { close(stop) })
+		<-done
+	}
 }
 
 func (p *progressTracker) printLine(op string) {
